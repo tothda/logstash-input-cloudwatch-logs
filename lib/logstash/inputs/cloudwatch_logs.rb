@@ -45,6 +45,9 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
   # Decide if log_group is a prefix or an absolute name
   config :log_group_prefix, :validate => :boolean, :default => false
 
+  config :stream_name, :validate => :string, :default => nil
+  config :start_from, :validate => :string, :default => nil
+
 
   # def register
   public
@@ -112,7 +115,13 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
       return list_new_streams_for_log_group(log_group, token=token, objects=objects, stepback=stepback)
     end
 
-    objects.push(*streams.log_streams)
+    if @stream_name
+      log_streams = streams.log_streams.select {|stream| stream.log_stream_name == @stream_name }
+      objects.push(*log_streams)
+    else
+      objects.push(*streams.log_streams)
+    end
+
     if streams.next_token == nil
       @logger.debug("CloudWatch Logs hit end of tokens for streams")
       objects
@@ -149,7 +158,13 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
   def process_group(queue)
     objects = list_new_streams
 
-    last_read = sincedb.read
+    if @start_from
+      @logger.info("Start reading logs from: #{@start_from}")
+      last_read = DateTime.parse("2017-06-24T19:37").to_time.to_i * 1000
+      @start_from = nil
+    else
+      last_read = sincedb.read
+    end
     current_window = DateTime.now.strftime('%Q')
 
     if last_read < 0
@@ -157,6 +172,7 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
     end
 
     objects.each do |stream|
+      @logger.info("#{stream.log_stream_name}  last_ingestion_time: #{stream.last_ingestion_time}  last_read: #{last_read}")
       if stream.last_ingestion_time && stream.last_ingestion_time > last_read
         process_log_stream(queue, stream, last_read, current_window)
       end
@@ -168,7 +184,7 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
   # def process_log_stream
   private
   def process_log_stream(queue, stream, last_read, current_window, token = nil, stepback=0)
-    @logger.debug("CloudWatch Logs processing stream",
+    @logger.info("CloudWatch Logs processing stream",
                   :log_stream => stream.log_stream_name,
                   :log_group => stream.arn.split(":")[6],
                   :lastRead => last_read,
@@ -179,7 +195,7 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
     params = {
         :log_group_name => stream.arn.split(":")[6],
         :log_stream_name => stream.log_stream_name,
-        :start_from_head => true
+        :start_time => last_read - 60 * 1000 # 60 sec safety window
     }
 
     if token != nil
@@ -196,6 +212,8 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
       @logger.debug("CloudWatch Logs repeating process_log_stream again with token", :token => token)
       return process_log_stream(queue, stream, last_read, current_window, token, stepback)
     end
+
+    @logger.info("Number of log events got: #{logs.events.count}")
 
     logs.events.each do |log|
       if log.ingestion_time > last_read
